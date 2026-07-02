@@ -25,4 +25,4 @@ vendor
 test/config/cache*
 /output
 .vscode/
-.fleet/
+.fleet/rsrc_windows_amd64.syso
