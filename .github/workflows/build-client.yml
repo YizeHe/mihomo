@@ -12,6 +12,7 @@ on:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           # Production builds
@@ -88,6 +89,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev
+
+      - name: Install dependencies (Windows)
+        if: matrix.goos == 'windows'
+        run: |
+          choco install mingw -y
 
       - name: Build
         env:
