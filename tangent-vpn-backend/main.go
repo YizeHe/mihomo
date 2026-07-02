@@ -20,11 +20,21 @@ func main() {
 	if err != nil {
 		log.Fatalf("cannot determine executable path: %v", err)
 	}
-	dbPath := filepath.Join(filepath.Dir(exe), "tangent_vpn.db")
+	exeDir := filepath.Dir(exe)
+	dbPath := filepath.Join(exeDir, "tangent_vpn.db")
 	if err := InitDB(dbPath); err != nil {
 		log.Fatalf("cannot open database: %v", err)
 	}
 	defer db.Close()
+
+	// Load activation codes from keytxt files on startup
+	yearFile := filepath.Join(exeDir, "year.keytxt")
+	monthFile := filepath.Join(exeDir, "month.keytxt")
+	loadKeyFile(yearFile, "year")
+	loadKeyFile(monthFile, "month")
+
+	// Start goroutine to watch keytxt files every 10 minutes
+	go watchKeyFiles(yearFile, monthFile)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", corsMiddleware(handler))
@@ -32,6 +42,65 @@ func main() {
 	addr := ":7878"
 	log.Printf("TangentVPN backend listening on %s", addr)
 	log.Fatal(http.ListenAndServe(addr, mux))
+}
+
+// loadKeyFile reads a keytxt file and adds codes to DB.
+func loadKeyFile(path, codeType string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Printf("Cannot read %s: %v (will retry)", path, err)
+		return
+	}
+	lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+	count := 0
+	for _, line := range lines {
+		code := strings.TrimSpace(line)
+		if code == "" {
+			continue
+		}
+		ac := &ActivationCode{
+			Code:      code,
+			Type:      codeType,
+			CreatedAt: time.Now(),
+		}
+		if err := AddActivationCode(ac); err == nil {
+			count++
+		}
+	}
+	if count > 0 {
+		log.Printf("Loaded %d %s activation codes from %s", count, codeType, path)
+	}
+}
+
+// watchKeyFiles checks keytxt files every 10 minutes for new codes.
+func watchKeyFiles(yearFile, monthFile string) {
+	// Track file mod times
+	getModTime := func(path string) time.Time {
+		info, err := os.Stat(path)
+		if err != nil {
+			return time.Time{}
+		}
+		return info.ModTime()
+	}
+
+	yearMod := getModTime(yearFile)
+	monthMod := getModTime(monthFile)
+
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if t := getModTime(yearFile); t.After(yearMod) {
+			log.Printf("year.keytxt changed, reloading...")
+			loadKeyFile(yearFile, "year")
+			yearMod = t
+		}
+		if t := getModTime(monthFile); t.After(monthMod) {
+			log.Printf("month.keytxt changed, reloading...")
+			loadKeyFile(monthFile, "month")
+			monthMod = t
+		}
+	}
 }
 
 // corsMiddleware wraps every request with CORS headers and handles OPTIONS preflight.
@@ -60,6 +129,8 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	// ---- public endpoints ----
+	case path == "/api/activate" && r.Method == http.MethodPost:
+		handleActivate(w, r)
 	case path == "/api/register" && r.Method == http.MethodPost:
 		handleRegister(w, r)
 	case path == "/api/login" && r.Method == http.MethodPost:
@@ -78,6 +149,15 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		handleAdminUpdateUser(w, r)
 	case strings.HasPrefix(path, "/api/users/") && r.Method == http.MethodDelete:
 		handleAdminDeleteUser(w, r)
+	// ---- distributor endpoints ----
+	case path == "/api/admin/distributors" && r.Method == http.MethodGet:
+		handleListDistributors(w, r)
+	case path == "/api/admin/distributors" && r.Method == http.MethodPost:
+		handleCreateDistributor(w, r)
+	case strings.HasPrefix(path, "/api/admin/distributors/") && r.Method == http.MethodDelete:
+		handleDeleteDistributor(w, r)
+	case path == "/api/admin/sales" && r.Method == http.MethodGet:
+		handleListSales(w, r)
 
 	default:
 		jsonError(w, "not found", http.StatusNotFound)
@@ -107,10 +187,91 @@ func bearerEmail(r *http.Request) (string, error) {
 
 // --------------- handlers ---------------
 
+func handleActivate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	code := strings.TrimSpace(req.Code)
+	if code == "" {
+		jsonError(w, "activation code is required", http.StatusBadRequest)
+		return
+	}
+
+	// Look up activation code
+	ac, err := GetActivationCode(code)
+	if err != nil {
+		jsonError(w, "invalid activation code", http.StatusUnauthorized)
+		return
+	}
+
+	// Calculate expiry based on type
+	now := time.Now()
+	var expires time.Time
+	if ac.Type == "year" {
+		expires = now.Add(365 * 24 * time.Hour)
+	} else {
+		expires = now.Add(30 * 24 * time.Hour)
+	}
+
+	// Create account: code@tanvpn.com / code
+	email := code + "@tanvpn.com"
+	hash, err := HashPassword(code)
+	if err != nil {
+		jsonError(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	// Try to create user (may already exist from previous activation)
+	existingUser, _ := GetUser(email)
+	if existingUser != nil {
+		// User exists - extend expiry from now
+		existingUser.ExpiresAt = expires
+		existingUser.IsActive = true
+		if err := UpdateUser(email, existingUser); err != nil {
+			jsonError(w, "failed to update account", http.StatusInternalServerError)
+			return
+		}
+	} else {
+		user := &User{
+			Email:     email,
+			Password:  hash,
+			CreatedAt: now,
+			ExpiresAt: expires,
+			IsActive:  true,
+		}
+		if err := CreateUser(user); err != nil {
+			jsonError(w, err.Error(), http.StatusConflict)
+			return
+		}
+	}
+
+	// Delete the activation code (one-time use)
+	DeleteActivationCode(code)
+
+	// Return login credentials for auto-login
+	token, err := GenerateJWT(email)
+	if err != nil {
+		jsonError(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	jsonWrite(w, http.StatusOK, map[string]string{
+		"token":      token,
+		"email":      email,
+		"expires_at": expires.Format(time.RFC3339),
+		"type":       ac.Type,
+	})
+}
+
 func handleRegister(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
+		Email      string `json:"email"`
+		Password   string `json:"password"`
+		InviteCode string `json:"invite_code"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, "invalid request body", http.StatusBadRequest)
@@ -127,13 +288,13 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	now := time.Now()
 	user := &User{
-		Email:     req.Email,
-		Password:  hash,
-		CreatedAt: now,
-		ExpiresAt: now.Add(30 * 24 * time.Hour),
-		IsActive:  true,
+		Email:      req.Email,
+		Password:   hash,
+		CreatedAt:  time.Now(),
+		ExpiresAt:  time.Time{}, // no free days
+		IsActive:   true,
+		InviteCode: req.InviteCode,
 	}
 	if err := CreateUser(user); err != nil {
 		jsonError(w, err.Error(), http.StatusConflict)
@@ -327,6 +488,9 @@ func handleAdminUpdateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Track if expiry was extended
+	oldExpiry := user.ExpiresAt
+
 	if req.ExpiresAt != nil {
 		t, err := time.Parse(time.RFC3339, *req.ExpiresAt)
 		if err != nil {
@@ -354,6 +518,15 @@ func handleAdminUpdateUser(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	// Record sale if expiry was extended and user has invite code
+	if req.ExpiresAt != nil && user.InviteCode != "" && user.ExpiresAt.After(oldExpiry) {
+		dist, err := GetDistributor(user.InviteCode)
+		if err == nil {
+			RecordSale(dist.Code, target, dist.CommissionRate)
+		}
+	}
+
 	jsonWrite(w, http.StatusOK, map[string]string{"message": "user updated"})
 }
 
@@ -373,4 +546,90 @@ func handleAdminDeleteUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonWrite(w, http.StatusOK, map[string]string{"message": "user deleted"})
+}
+
+// ---------- Distributor handlers ----------
+
+func handleCreateDistributor(w http.ResponseWriter, r *http.Request) {
+	email, err := bearerEmail(r)
+	if err != nil || email != "__admin__" {
+		jsonError(w, "admin auth required", http.StatusUnauthorized)
+		return
+	}
+	var req struct {
+		Code           string  `json:"code"`
+		CommissionRate float64 `json:"commission_rate"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Code == "" {
+		jsonError(w, "code is required", http.StatusBadRequest)
+		return
+	}
+	d := &Distributor{
+		Code:           req.Code,
+		CommissionRate: req.CommissionRate,
+		CreatedAt:      time.Now(),
+	}
+	if err := CreateDistributor(d); err != nil {
+		jsonError(w, err.Error(), http.StatusConflict)
+		return
+	}
+	jsonWrite(w, http.StatusCreated, map[string]string{"message": "distributor created"})
+}
+
+func handleListDistributors(w http.ResponseWriter, r *http.Request) {
+	email, err := bearerEmail(r)
+	if err != nil || email != "__admin__" {
+		jsonError(w, "admin auth required", http.StatusUnauthorized)
+		return
+	}
+	list, err := ListDistributors()
+	if err != nil {
+		jsonError(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	jsonWrite(w, http.StatusOK, list)
+}
+
+func handleDeleteDistributor(w http.ResponseWriter, r *http.Request) {
+	email, err := bearerEmail(r)
+	if err != nil || email != "__admin__" {
+		jsonError(w, "admin auth required", http.StatusUnauthorized)
+		return
+	}
+	code := strings.TrimPrefix(r.URL.Path, "/api/admin/distributors/")
+	if code == "" {
+		jsonError(w, "code is required", http.StatusBadRequest)
+		return
+	}
+	if err := DeleteDistributor(code); err != nil {
+		jsonError(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	jsonWrite(w, http.StatusOK, map[string]string{"message": "distributor deleted"})
+}
+
+// ---------- Sale handlers ----------
+
+func handleListSales(w http.ResponseWriter, r *http.Request) {
+	email, err := bearerEmail(r)
+	if err != nil || email != "__admin__" {
+		jsonError(w, "admin auth required", http.StatusUnauthorized)
+		return
+	}
+	code := r.URL.Query().Get("distributor")
+	var sales []Sale
+	if code != "" {
+		sales, err = GetSalesByDistributor(code)
+	} else {
+		sales, err = ListSales()
+	}
+	if err != nil {
+		jsonError(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	jsonWrite(w, http.StatusOK, sales)
 }

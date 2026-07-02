@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -25,6 +26,16 @@ import (
 )
 
 const mihomoAPI = "http://127.0.0.1:19090"
+
+type tangentApp struct {
+	fyneApp   fyne.App
+	mainWin   fyne.Window
+	token     string
+	email     string
+	expiresAt string
+	proxyOn   bool
+	prevMode  string
+}
 
 // ---------- File logger ----------
 
@@ -48,16 +59,6 @@ func logf(format string, args ...interface{}) {
 		logFile.WriteString(msg)
 		logFile.Sync()
 	}
-}
-
-type tangentApp struct {
-	fyneApp   fyne.App
-	mainWin   fyne.Window
-	token     string
-	email     string
-	expiresAt string
-	proxyOn   bool
-	prevMode  string
 }
 
 // ---------- Session persistence ----------
@@ -205,8 +206,30 @@ func backendLogin(email, password string) (*loginResponse, error) {
 	return &result, nil
 }
 
-func backendRegister(email, password string) error {
-	payload := map[string]string{"email": email, "password": password}
+func backendActivate(code string) (*loginResponse, error) {
+	payload := map[string]string{"code": code}
+	data, _ := json.Marshal(payload)
+	resp, err := http.Post(BackendURL+"/api/activate", "application/json", bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("server connection failed: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var result loginResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("parse response error: %w", err)
+	}
+	if result.Error != "" {
+		return nil, fmt.Errorf(result.Error)
+	}
+	if result.Token == "" {
+		return nil, fmt.Errorf("activation failed: no token received")
+	}
+	return &result, nil
+}
+
+func backendRegister(email, password, inviteCode string) error {
+	payload := map[string]string{"email": email, "password": password, "invite_code": inviteCode}
 	data, _ := json.Marshal(payload)
 	resp, err := http.Post(BackendURL+"/api/register", "application/json", bytes.NewReader(data))
 	if err != nil {
@@ -244,7 +267,6 @@ func runGUI() {
 	}
 
 	fyneApp := app.New()
-	logf("Fyne app created")
 	mainWin := fyneApp.NewWindow("TangentVPN")
 	mainWin.Resize(fyne.NewSize(500, 600))
 	mainWin.CenterOnScreen()
@@ -262,21 +284,105 @@ func runGUI() {
 		ta.email = saved.Email
 		ta.token = saved.Token
 		ta.expiresAt = saved.ExpiresAt
-		log.Infoln("Loaded saved session for: %s", saved.Email)
 		ta.mainWin.SetTitle("TangentVPN - " + saved.Email)
 		ta.mainWin.SetContent(ta.buildLoadingContent())
 		go ta.startMihomo()
 	} else {
-		ta.showLoginWindow()
+		ta.showActivationScreen()
 	}
 
 	mainWin.ShowAndRun()
 }
 
-// ---------- Login Window ----------
+// ---------- Activation Screen (Primary) ----------
+
+func (ta *tangentApp) showActivationScreen() {
+	ta.mainWin.SetTitle("TangentVPN")
+
+	title := widget.NewLabel("TangentVPN")
+	title.TextStyle = fyne.TextStyle{Bold: true}
+	title.Alignment = fyne.TextAlignCenter
+
+	codeEntry := widget.NewEntry()
+	codeEntry.SetPlaceHolder("Enter your activation code")
+
+	activateBtn := widget.NewButton("Activate", nil)
+	activateBtn.Importance = widget.HighImportance
+
+	switchBtn := widget.NewButton("Switch to Login", nil)
+	switchBtn.Importance = widget.LowImportance
+
+	statusLabel := widget.NewLabel("")
+	statusLabel.Wrapping = fyne.TextWrapWord
+
+	activateBtn.OnTapped = func() {
+		code := strings.TrimSpace(codeEntry.Text)
+		if code == "" {
+			statusLabel.SetText("Please enter your activation code")
+			return
+		}
+
+		activateBtn.Disable()
+		statusLabel.SetText("Activating...")
+
+		go func() {
+			logf("Activation attempt: %s", code)
+			result, err := backendActivate(code)
+			if err != nil {
+				logf("Activation failed: %v", err)
+				statusLabel.SetText("Activation failed: " + err.Error())
+				activateBtn.Enable()
+				canvas.Refresh(statusLabel)
+				canvas.Refresh(activateBtn)
+				return
+			}
+
+			ta.token = result.Token
+			ta.email = result.Email
+			ta.expiresAt = result.ExpiresAt
+
+			// Save session
+			if err := saveSession(&sessionData{
+				Email:     result.Email,
+				Token:     result.Token,
+				ExpiresAt: result.ExpiresAt,
+			}); err != nil {
+				logf("WARN: save session failed: %v", err)
+			}
+
+			logf("Activation OK: %s, expires: %s", result.Email, result.ExpiresAt)
+
+			ta.mainWin.SetContent(ta.buildLoadingContent())
+			ta.mainWin.SetTitle("TangentVPN - " + result.Email)
+			go ta.startMihomo()
+		}()
+	}
+
+	switchBtn.OnTapped = func() {
+		ta.showLoginWindow()
+	}
+
+	form := container.NewVBox(
+		layout.NewSpacer(),
+		title,
+		widget.NewLabel(""),
+		widget.NewLabel("Activation Code"),
+		codeEntry,
+		widget.NewLabel(""),
+		activateBtn,
+		statusLabel,
+		layout.NewSpacer(),
+		container.NewHBox(layout.NewSpacer(), switchBtn),
+	)
+
+	padded := container.NewPadded(form)
+	ta.mainWin.SetContent(padded)
+}
+
+// ---------- Login Window (Secondary - via Switch button) ----------
 
 func (ta *tangentApp) showLoginWindow() {
-	ta.mainWin.SetTitle("TangentVPN")
+	ta.mainWin.SetTitle("TangentVPN - Login")
 
 	title := widget.NewLabel("TangentVPN")
 	title.TextStyle = fyne.TextStyle{Bold: true}
@@ -293,6 +399,9 @@ func (ta *tangentApp) showLoginWindow() {
 
 	registerBtn := widget.NewButton("Register", nil)
 	registerBtn.Importance = widget.LowImportance
+
+	switchBtn := widget.NewButton("Back to Activation", nil)
+	switchBtn.Importance = widget.LowImportance
 
 	statusLabel := widget.NewLabel("")
 	statusLabel.Wrapping = fyne.TextWrapWord
@@ -323,28 +432,29 @@ func (ta *tangentApp) showLoginWindow() {
 			ta.token = result.Token
 			ta.email = result.Email
 			ta.expiresAt = result.ExpiresAt
-			logf("Login OK: %s, expires: %s", result.Email, result.ExpiresAt)
 
-			// Save session
 			if err := saveSession(&sessionData{
 				Email:     result.Email,
 				Token:     result.Token,
 				ExpiresAt: result.ExpiresAt,
 			}); err != nil {
-				log.Warnln("Failed to save session: %s", err.Error())
+				logf("WARN: save session failed: %v", err)
 			}
 
-			log.Infoln("User logged in: %s", result.Email)
+			logf("Login OK: %s", result.Email)
 
 			ta.mainWin.SetContent(ta.buildLoadingContent())
 			ta.mainWin.SetTitle("TangentVPN - " + result.Email)
-
 			go ta.startMihomo()
 		}()
 	}
 
 	registerBtn.OnTapped = func() {
 		ta.showRegistrationDialog()
+	}
+
+	switchBtn.OnTapped = func() {
+		ta.showActivationScreen()
 	}
 
 	form := container.NewVBox(
@@ -360,6 +470,7 @@ func (ta *tangentApp) showLoginWindow() {
 		registerBtn,
 		statusLabel,
 		layout.NewSpacer(),
+		container.NewHBox(layout.NewSpacer(), switchBtn),
 	)
 
 	padded := container.NewPadded(form)
@@ -378,10 +489,14 @@ func (ta *tangentApp) showRegistrationDialog() {
 	confirmEntry := widget.NewPasswordEntry()
 	confirmEntry.SetPlaceHolder("Confirm Password")
 
+	inviteEntry := widget.NewEntry()
+	inviteEntry.SetPlaceHolder("Optional - $5 discount")
+
 	items := []*widget.FormItem{
 		{Text: "Email", Widget: emailEntry},
 		{Text: "Password", Widget: passwordEntry},
 		{Text: "Confirm", Widget: confirmEntry},
+		{Text: "Invite Code", Widget: inviteEntry},
 	}
 
 	dialog.ShowForm("Register", "Register", "Cancel", items, func(ok bool) {
@@ -391,6 +506,7 @@ func (ta *tangentApp) showRegistrationDialog() {
 		email := strings.TrimSpace(emailEntry.Text)
 		password := passwordEntry.Text
 		confirm := confirmEntry.Text
+		inviteCode := strings.TrimSpace(inviteEntry.Text)
 
 		if email == "" || password == "" {
 			dialog.ShowError(fmt.Errorf("please fill all fields"), ta.mainWin)
@@ -406,12 +522,16 @@ func (ta *tangentApp) showRegistrationDialog() {
 		}
 
 		go func() {
-			err := backendRegister(email, password)
+			err := backendRegister(email, password, inviteCode)
 			if err != nil {
 				dialog.ShowError(fmt.Errorf("registration failed: %s", err.Error()), ta.mainWin)
 				return
 			}
-			dialog.ShowInformation("Success", "Please login with your new account", ta.mainWin)
+			dialog.ShowInformation("Registration Successful",
+				"Your account has no active plan yet.\n\n"+
+					"Please contact the admin to purchase:\n"+
+					"  Email: tangent2533@gmail.com\n"+
+					"  WeChat: tangentlab", ta.mainWin)
 		}()
 	}, ta.mainWin)
 }
@@ -482,7 +602,7 @@ func (ta *tangentApp) startMihomo() {
 }
 
 func (ta *tangentApp) showErrorAndRetry(err error) {
-	log.Errorln("Proxy error: %s", err.Error())
+	logf("Proxy error: %s", err.Error())
 
 	title := widget.NewLabel("Error")
 	title.TextStyle = fyne.TextStyle{Bold: true}
@@ -505,7 +625,7 @@ func (ta *tangentApp) showErrorAndRetry(err error) {
 		ta.email = ""
 		ta.expiresAt = ""
 		ta.proxyOn = false
-		ta.showLoginWindow()
+		ta.showActivationScreen()
 	}
 
 	content := container.NewVBox(
@@ -544,7 +664,7 @@ func (ta *tangentApp) buildMainContent() fyne.CanvasObject {
 		ta.email = ""
 		ta.expiresAt = ""
 		ta.proxyOn = false
-		ta.showLoginWindow()
+		ta.showActivationScreen()
 	}
 
 	topBar := container.NewHBox(
@@ -557,10 +677,28 @@ func (ta *tangentApp) buildMainContent() fyne.CanvasObject {
 	// Expiry warning
 	var expiryWarning fyne.CanvasObject
 	if ta.isExpired() {
-		warnLabel := widget.NewLabel("Account expired. Contact: tangent2533@gmail.com")
+		warnLabel := widget.NewLabel("Plan expired. Please activate a new code or contact tangent2533@gmail.com")
 		warnLabel.Wrapping = fyne.TextWrapWord
 		warnLabel.Importance = widget.HighImportance
-		expiryWarning = warnLabel
+
+		buyBtn := widget.NewButton("Buy New Code", nil)
+		buyBtn.Importance = widget.HighImportance
+		buyBtn.OnTapped = func() {
+			openBrowser("https://tangentlab2533.github.io")
+		}
+
+		newCodeBtn := widget.NewButton("Enter New Code", nil)
+		newCodeBtn.OnTapped = func() {
+			UnsetSystemProxy()
+			deleteSession()
+			ta.token = ""
+			ta.email = ""
+			ta.expiresAt = ""
+			ta.proxyOn = false
+			ta.showActivationScreen()
+		}
+
+		expiryWarning = container.NewVBox(warnLabel, buyBtn, newCodeBtn)
 	}
 
 	// Proxy status
@@ -586,7 +724,6 @@ func (ta *tangentApp) buildMainContent() fyne.CanvasObject {
 	if NoSysProxy {
 		infoLabel = widget.NewLabel("Proxy: HTTP=127.0.0.1:7899 SOCKS5=127.0.0.1:7898 (system proxy disabled)")
 	}
-	infoLabel.Wrapping = fyne.TextWrapWord
 
 	// --- Callbacks ---
 
@@ -812,4 +949,28 @@ func (ta *tangentApp) isExpired() bool {
 		}
 	}
 	return time.Now().After(t)
+}
+
+// ---------- Browser helper ----------
+
+func openBrowser(url string) {
+	var cmd string
+	var args []string
+	switch {
+	case strings.Contains(strings.ToLower(os.Getenv("OS")), "windows"):
+		cmd = "cmd"
+		args = []string{"/c", "start", url}
+	case fileExists("/usr/bin/open"):
+		cmd = "/usr/bin/open"
+		args = []string{url}
+	default:
+		cmd = "xdg-open"
+		args = []string{url}
+	}
+	exec.Command(cmd, args...).Start()
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
