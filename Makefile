@@ -204,3 +204,27 @@ clean:
 CLANG ?= clang-14
 CFLAGS := -O2 -g -Wall -Werror $(CFLAGS)
 
+# ─── TangentVPN ───────────────────────────────────────────────────────────────
+
+TANGENT_VERSION=1
+TANGENT_BACKEND_PROD=http://47.84.235.137:7878
+TANGENT_BACKEND_LOCAL=http://127.0.0.1:7878
+
+tangentvpn: tangentvpn-prod tangentvpn-local tangentvpn-backend
+
+tangentvpn-prod:
+	CGO_ENABLED=1 go build -tags with_gvisor -trimpath -ldflags \
+		"-s -w -X main.BackendURL=$(TANGENT_BACKEND_PROD)" \
+		-o TangentVPN.exe .
+
+tangentvpn-local:
+	CGO_ENABLED=1 go build -tags with_gvisor -trimpath -ldflags \
+		"-s -w -X main.BackendURL=$(TANGENT_BACKEND_LOCAL)" \
+		-o TangentVPN_localtest.exe .
+
+tangentvpn-backend:
+	cd tangent-vpn-backend && CGO_ENABLED=0 go build -o ../tangent-vpn-backend.exe .
+
+tangentvpn-clean:
+	rm -f TangentVPN.exe TangentVPN_localtest.exe tangent-vpn-backend.exe
+
