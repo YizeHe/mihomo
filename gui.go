@@ -284,14 +284,165 @@ func runGUI() {
 		ta.email = saved.Email
 		ta.token = saved.Token
 		ta.expiresAt = saved.ExpiresAt
-		ta.mainWin.SetTitle("TangentVPN - " + saved.Email)
-		ta.mainWin.SetContent(ta.buildLoadingContent())
-		go ta.startMihomo()
+
+		// Check if expired on startup
+		if ta.isExpired() {
+			logf("Session expired, showing activation screen")
+			ta.showExpiredActivationScreen()
+		} else {
+			ta.mainWin.SetTitle("TangentVPN - " + saved.Email)
+			ta.mainWin.SetContent(ta.buildLoadingContent())
+			go ta.startMihomo()
+		}
 	} else {
 		ta.showActivationScreen()
 	}
 
 	mainWin.ShowAndRun()
+}
+
+// startExpiryChecker checks every 10 minutes if the plan is expired.
+func (ta *tangentApp) startExpiryChecker() {
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		if ta.isExpired() {
+			logf("Expiry check: plan expired!")
+			UnsetSystemProxy()
+			ta.proxyOn = false
+			ta.mainWin.SetContent(ta.buildExpiredContent())
+		}
+	}
+}
+
+// ---------- Expired Activation Screen ----------
+
+func (ta *tangentApp) showExpiredActivationScreen() {
+	ta.mainWin.SetTitle("TangentVPN - Expired")
+
+	title := widget.NewLabel("TangentVPN")
+	title.TextStyle = fyne.TextStyle{Bold: true}
+	title.Alignment = fyne.TextAlignCenter
+
+	warnLabel := widget.NewLabel("Your plan has expired.")
+	warnLabel.Wrapping = fyne.TextWrapWord
+	warnLabel.Importance = widget.HighImportance
+
+	contactLabel := widget.NewLabel("Contact tangent2533@gmail.com to purchase a new code.")
+
+	buyBtn := widget.NewButton("Buy New Code", nil)
+	buyBtn.Importance = widget.HighImportance
+	buyBtn.OnTapped = func() {
+		openBrowser("https://tangentlab2533.github.io")
+	}
+
+	codeEntry := widget.NewEntry()
+	codeEntry.SetPlaceHolder("Enter new activation code")
+
+	activateBtn := widget.NewButton("Activate New Code", nil)
+	activateBtn.Importance = widget.HighImportance
+
+	switchBtn := widget.NewButton("Switch to Login", nil)
+	switchBtn.Importance = widget.LowImportance
+
+	statusLabel := widget.NewLabel("")
+	statusLabel.Wrapping = fyne.TextWrapWord
+
+	activateBtn.OnTapped = func() {
+		code := strings.TrimSpace(codeEntry.Text)
+		if code == "" {
+			statusLabel.SetText("Please enter your activation code")
+			return
+		}
+		activateBtn.Disable()
+		statusLabel.SetText("Activating...")
+
+		go func() {
+			logf("Re-activation attempt: %s", code)
+			result, err := backendActivate(code)
+			if err != nil {
+				logf("Re-activation failed: %v", err)
+				statusLabel.SetText("Activation failed: " + err.Error())
+				activateBtn.Enable()
+				canvas.Refresh(statusLabel)
+				canvas.Refresh(activateBtn)
+				return
+			}
+
+			// Delete old session, save new
+			deleteSession()
+			ta.token = result.Token
+			ta.email = result.Email
+			ta.expiresAt = result.ExpiresAt
+
+			if err := saveSession(&sessionData{
+				Email:     result.Email,
+				Token:     result.Token,
+				ExpiresAt: result.ExpiresAt,
+			}); err != nil {
+				logf("WARN: save session failed: %v", err)
+			}
+
+			logf("Re-activation OK: %s, expires: %s", result.Email, result.ExpiresAt)
+			ta.mainWin.SetContent(ta.buildLoadingContent())
+			ta.mainWin.SetTitle("TangentVPN - " + result.Email)
+			go ta.startMihomo()
+		}()
+	}
+
+	switchBtn.OnTapped = func() {
+		ta.showLoginWindow()
+	}
+
+	form := container.NewVBox(
+		layout.NewSpacer(),
+		title,
+		widget.NewSeparator(),
+		warnLabel,
+		contactLabel,
+		buyBtn,
+		widget.NewLabel(""),
+		widget.NewLabel("New Activation Code"),
+		codeEntry,
+		activateBtn,
+		statusLabel,
+		layout.NewSpacer(),
+		container.NewHBox(layout.NewSpacer(), switchBtn),
+	)
+
+	ta.mainWin.SetContent(container.NewPadded(form))
+}
+
+// buildExpiredContent is shown when expiry is detected during runtime.
+func (ta *tangentApp) buildExpiredContent() fyne.CanvasObject {
+	title := widget.NewLabel("Plan Expired")
+	title.TextStyle = fyne.TextStyle{Bold: true}
+	title.Alignment = fyne.TextAlignCenter
+
+	warnLabel := widget.NewLabel("Your plan has expired. Proxy has been disabled.")
+	warnLabel.Wrapping = fyne.TextWrapWord
+	warnLabel.Importance = widget.HighImportance
+
+	buyBtn := widget.NewButton("Buy New Code", nil)
+	buyBtn.Importance = widget.HighImportance
+	buyBtn.OnTapped = func() {
+		openBrowser("https://tangentlab2533.github.io")
+	}
+
+	newCodeBtn := widget.NewButton("Enter New Code", nil)
+	newCodeBtn.OnTapped = func() {
+		ta.showExpiredActivationScreen()
+	}
+
+	return container.NewPadded(container.NewVBox(
+		layout.NewSpacer(),
+		title,
+		warnLabel,
+		widget.NewLabel(""),
+		buyBtn,
+		newCodeBtn,
+		layout.NewSpacer(),
+	))
 }
 
 // ---------- Activation Screen (Primary) ----------
@@ -337,6 +488,8 @@ func (ta *tangentApp) showActivationScreen() {
 				return
 			}
 
+			// Delete old session, save new
+			deleteSession()
 			ta.token = result.Token
 			ta.email = result.Email
 			ta.expiresAt = result.ExpiresAt
@@ -429,6 +582,8 @@ func (ta *tangentApp) showLoginWindow() {
 				return
 			}
 
+			// Delete old session, save new
+			deleteSession()
 			ta.token = result.Token
 			ta.email = result.Email
 			ta.expiresAt = result.ExpiresAt
@@ -599,6 +754,9 @@ func (ta *tangentApp) startMihomo() {
 
 	logf("Showing main panel")
 	ta.mainWin.SetContent(ta.buildMainContent())
+
+	// Start periodic expiry checker
+	go ta.startExpiryChecker()
 }
 
 func (ta *tangentApp) showErrorAndRetry(err error) {
@@ -620,7 +778,7 @@ func (ta *tangentApp) showErrorAndRetry(err error) {
 	logoutBtn := widget.NewButton("Logout", nil)
 	logoutBtn.Importance = widget.DangerImportance
 	logoutBtn.OnTapped = func() {
-		deleteSession()
+		// Don't delete session - just go back to activation
 		ta.token = ""
 		ta.email = ""
 		ta.expiresAt = ""
@@ -659,7 +817,7 @@ func (ta *tangentApp) buildMainContent() fyne.CanvasObject {
 	logoutBtn := widget.NewButton("Logout", nil)
 	logoutBtn.OnTapped = func() {
 		UnsetSystemProxy()
-		deleteSession()
+		// Don't delete session - just go back to activation
 		ta.token = ""
 		ta.email = ""
 		ta.expiresAt = ""
@@ -690,12 +848,9 @@ func (ta *tangentApp) buildMainContent() fyne.CanvasObject {
 		newCodeBtn := widget.NewButton("Enter New Code", nil)
 		newCodeBtn.OnTapped = func() {
 			UnsetSystemProxy()
-			deleteSession()
-			ta.token = ""
-			ta.email = ""
-			ta.expiresAt = ""
+			// Don't delete session - just go to expired activation screen
 			ta.proxyOn = false
-			ta.showActivationScreen()
+			ta.showExpiredActivationScreen()
 		}
 
 		expiryWarning = container.NewVBox(warnLabel, buyBtn, newCodeBtn)
