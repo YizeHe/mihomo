@@ -288,6 +288,7 @@ func runGUI() {
 		// Check if expired on startup
 		if ta.isExpired() {
 			logf("Session expired, showing activation screen")
+			openBrowser("https://tangentlab2533.github.io")
 			ta.showExpiredActivationScreen()
 		} else {
 			ta.mainWin.SetTitle("TangentVPN - " + saved.Email)
@@ -309,8 +310,10 @@ func (ta *tangentApp) startExpiryChecker() {
 		if ta.isExpired() {
 			logf("Expiry check: plan expired!")
 			UnsetSystemProxy()
+			executor.Shutdown()
 			ta.proxyOn = false
-			ta.mainWin.SetContent(ta.buildExpiredContent())
+			openBrowser("https://tangentlab2533.github.io")
+			ta.showExpiredActivationScreen()
 		}
 	}
 }
@@ -324,11 +327,12 @@ func (ta *tangentApp) showExpiredActivationScreen() {
 	title.TextStyle = fyne.TextStyle{Bold: true}
 	title.Alignment = fyne.TextAlignCenter
 
-	warnLabel := widget.NewLabel("Your plan has expired.")
+	warnLabel := widget.NewLabel("Your plan has expired. All services are disabled.")
 	warnLabel.Wrapping = fyne.TextWrapWord
 	warnLabel.Importance = widget.HighImportance
 
 	contactLabel := widget.NewLabel("Contact tangent2533@gmail.com to purchase a new code.")
+	contactLabel.Wrapping = fyne.TextWrapWord
 
 	buyBtn := widget.NewButton("Buy New Code", nil)
 	buyBtn.Importance = widget.HighImportance
@@ -419,9 +423,12 @@ func (ta *tangentApp) buildExpiredContent() fyne.CanvasObject {
 	title.TextStyle = fyne.TextStyle{Bold: true}
 	title.Alignment = fyne.TextAlignCenter
 
-	warnLabel := widget.NewLabel("Your plan has expired. Proxy has been disabled.")
+	warnLabel := widget.NewLabel("Your plan has expired. All services are disabled.")
 	warnLabel.Wrapping = fyne.TextWrapWord
 	warnLabel.Importance = widget.HighImportance
+
+	contactLabel := widget.NewLabel("Contact tangent2533@gmail.com for a new code.")
+	contactLabel.Wrapping = fyne.TextWrapWord
 
 	buyBtn := widget.NewButton("Buy New Code", nil)
 	buyBtn.Importance = widget.HighImportance
@@ -438,6 +445,7 @@ func (ta *tangentApp) buildExpiredContent() fyne.CanvasObject {
 		layout.NewSpacer(),
 		title,
 		warnLabel,
+		contactLabel,
 		widget.NewLabel(""),
 		buyBtn,
 		newCodeBtn,
